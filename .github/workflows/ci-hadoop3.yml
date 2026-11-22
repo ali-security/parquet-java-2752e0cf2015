@@ -17,12 +17,19 @@
 
 name: CI Hadoop 3
 
-on: [push, pull_request]
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Optional Maven test selector (e.g. -Dtest=Foo); empty runs the full suite'
+        required: false
+        default: ''
 
 jobs:
   build:
 
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     strategy:
       fail-fast: false
       matrix:
@@ -37,11 +44,27 @@ jobs:
         with:
           distribution: temurin
           java-version: ${{ matrix.java.setup }}
+          cache: maven
+      - name: Cache thrift compiler
+        id: thrift-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/thrift-bin
+          key: thrift-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('dev/ci-before_install.sh') }}
+      - name: Install cached thrift compiler
+        if: steps.thrift-cache.outputs.cache-hit == 'true'
+        run: |
+          sudo cp ~/thrift-bin/thrift /usr/local/bin/thrift
+          sudo chmod +x /usr/local/bin/thrift
+          thrift --version
       - name: before_install
+        if: steps.thrift-cache.outputs.cache-hit != 'true'
         env:
           CI_TARGET_BRANCH: $GITHUB_HEAD_REF
         run: |
           bash dev/ci-before_install.sh
+          mkdir -p ~/thrift-bin
+          cp /usr/local/bin/thrift ~/thrift-bin/thrift
       - name: install
         run: |
           EXTRA_JAVA_TEST_ARGS=$(./mvnw help:evaluate -Dexpression=extraJavaTestArgs -q -DforceStdout)
@@ -54,4 +77,51 @@ jobs:
         run: |
           EXTRA_JAVA_TEST_ARGS=$(./mvnw help:evaluate -Dexpression=extraJavaTestArgs -q -DforceStdout)
           export MAVEN_OPTS="$MAVEN_OPTS $EXTRA_JAVA_TEST_ARGS"
-          ./mvnw verify --batch-mode javadoc:javadoc
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            ./mvnw verify --batch-mode -Drat.skip=true -Dspotless.check.skip=true -Djapicmp.skip=true -Dsurefire.failIfNoSpecifiedTests=false ${{ inputs.test-filter }}
+          else
+            ./mvnw verify --batch-mode javadoc:javadoc -Drat.skip=true -Dspotless.check.skip=true -Djapicmp.skip=true
+          fi
+      - name: Run Hadoop vector-IO bridge tests against Hadoop 3.3.6
+        if: ${{ inputs.test-filter == '' }}
+        env:
+          TEST_CODECS: ${{ matrix.codes }}
+          JAVA_VERSION: ${{ matrix.java.setup }}
+        run: |
+          # TestFileRangeBridge/TestVectorIoBridge assume-skip with the default hadoop.version 3.3.0
+          # (org.apache.hadoop.fs.FileRange first shipped in Hadoop 3.3.5); rerun them where they can execute.
+          EXTRA_JAVA_TEST_ARGS=$(./mvnw help:evaluate -Dexpression=extraJavaTestArgs -q -DforceStdout)
+          export MAVEN_OPTS="$MAVEN_OPTS $EXTRA_JAVA_TEST_ARGS"
+          ./mvnw test --batch-mode -pl parquet-hadoop -Dhadoop.version=3.3.6 -Dtest=TestFileRangeBridge,TestVectorIoBridge -Dsurefire.failIfNoSpecifiedTests=false -Drat.skip=true -Dspotless.check.skip=true -Djapicmp.skip=true
+      - name: Test results summary
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import glob, xml.etree.ElementTree as ET
+          tot = fail = err = skip = 0
+          skipped = []
+          for f in sorted(glob.glob('**/target/surefire-reports/TEST-*.xml', recursive=True)):
+              try:
+                  r = ET.parse(f).getroot()
+              except Exception as e:
+                  print('unparseable', f, e)
+                  continue
+              tot += int(r.get('tests', 0)); fail += int(r.get('failures', 0))
+              err += int(r.get('errors', 0)); skip += int(r.get('skipped', 0))
+              for tc in r.iter('testcase'):
+                  s = tc.find('skipped')
+                  if s is not None:
+                      skipped.append('%s.%s: %s' % (tc.get('classname'), tc.get('name'), (s.get('message') or s.text or 'no message').strip()[:300]))
+          print('SUREFIRE TOTALS: tests=%d failures=%d errors=%d skipped=%d passed=%d' % (tot, fail, err, skip, tot - fail - err - skip))
+          for line in skipped:
+              print('SKIPPED', line)
+          PY
+      - name: Upload parquet-format-structures jars
+        if: ${{ matrix.java.setup == '11' && matrix.codes == 'uncompressed,brotli' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: parquet-format-structures-jars
+          path: |
+            parquet-format-structures/target/parquet-format-structures-1.17.1.jar
+            parquet-format-structures/target/parquet-format-structures-1.17.1-tests.jar
+          if-no-files-found: error
